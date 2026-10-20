@@ -149,9 +149,9 @@ if st.sidebar.button("🔄 Refrescar Tablero", width='stretch'):
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Estado del Sistema:**")
 st.sidebar.write(f"• **Supabase DB:** {'🟢 Conectado' if os.getenv('SUPABASE_URL') else '🔴 Desconectado'}")
-st.sidebar.write(f"• **Qdrant Vector DB:** {'🟢 Conectado' if os.getenv('QDRANT_HOST') else '🔴 Desconectado'}")
+st.sidebar.write(f"• **Qdrant Vector DB:** {'🟢 Conectado' if os.getenv('QDRANT_URL') else '🔴 Desconectado'}")
 st.sidebar.write(f"• **Broker API:** Alpaca Paper Cloud")
-st.sidebar.write(f"• **Motor LLM:** Claude 3.5 Sonnet")
+st.sidebar.write(f"• **Motor LLM:** Claude 5.5 Sonnet")
 st.sidebar.markdown("---")
 st.sidebar.info("💡 **Tip:** Puedes modificar los activos activos en la pestaña 'Administrar Universo' para afinar el escaneo de mañana.")
 
