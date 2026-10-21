@@ -1,11 +1,19 @@
 import os
+import datetime
 from pathlib import Path
+from typing import Dict, List, Tuple
 import pandas as pd
+import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
+import yfinance as yf
+
 from qdrant_client import QdrantClient
 from supabase import create_client, Client
+
+from alpaca.trading.client import TradingClient
 
 # ==============================================================================
 # CONFIGURACIÓN GENERAL Y ESTILOS
@@ -32,47 +40,63 @@ st.markdown("""
 
 
 # ==============================================================================
-# CLIENTES DE BASES DE DATOS (CON CACHÉ)
+# RESUELVE SECRETOS (STREAMLIT CLOUD / LOCAL .ENV)
 # ==============================================================================
-#@st.cache_resource
-#def get_supabase_client() -> Client:
-#    url = os.getenv("SUPABASE_URL")
-#    key = os.getenv("SUPABASE_KEY")
-#    if not url or not key:
-#        st.error("Credenciales de Supabase no configuradas en el archivo .env")
-#    return create_client(url, key)
+def get_config_val(key: str, default=None):
+    """Obtiene credenciales desde st.secrets o variables de entorno."""
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key, default)
 
-#@st.cache_resource
-#def get_qdrant_client() -> QdrantClient:
-#    host = os.getenv("QDRANT_HOST", "localhost")
-#    port = int(os.getenv("QDRANT_PORT", "6333"))
-#    return QdrantClient(host=host, port=port)
+
+# ==============================================================================
+# CLIENTES DE BASES DE DATOS Y BROKER (CON CACHÉ)
+# ==============================================================================
+@st.cache_resource
+def get_supabase_client() -> Client:
+    url = get_config_val("SUPABASE_URL")
+    key = get_config_val("SUPABASE_KEY")
+    if not url or not key:
+        st.error("Credenciales de Supabase no configuradas.")
+    return create_client(url, key)
+
 
 @st.cache_resource
 def get_qdrant_client() -> QdrantClient:
-    # 1. Intentar leer de st.secrets (para Streamlit Cloud) o de os.getenv (para local/.env)
-    qdrant_url = st.secrets.get("QDRANT_URL") if hasattr(st, "secrets") and "QDRANT_URL" in st.secrets else os.getenv("QDRANT_URL")
-    qdrant_api_key = st.secrets.get("QDRANT_API_KEY") if hasattr(st, "secrets") and "QDRANT_API_KEY" in st.secrets else os.getenv("QDRANT_API_KEY")
+    qdrant_url = get_config_val("QDRANT_URL")
+    qdrant_api_key = get_config_val("QDRANT_API_KEY")
 
-    if qdrant_url and qdrant_api_key:
-        return QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+    if qdrant_url:
+        url_clean = str(qdrant_url).strip()
+        if not url_clean.startswith("http://") and not url_clean.startswith("https://"):
+            url_clean = f"https://{url_clean}"
+        return QdrantClient(url=url_clean, api_key=qdrant_api_key if qdrant_api_key else None)
 
-    # Fallback local
-    host = os.getenv("QDRANT_HOST", "localhost")
-    port = int(os.getenv("QDRANT_PORT", "6333"))
-    return QdrantClient(host=host, port=port)
 
 
 @st.cache_resource
-def get_supabase_client() -> Client:
-    url = st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") and "SUPABASE_URL" in st.secrets else os.getenv("SUPABASE_URL")
-    key = st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") and "SUPABASE_KEY" in st.secrets else os.getenv("SUPABASE_KEY")
-    return create_client(url, key)
+def get_alpaca_client() -> TradingClient | None:
+    api_key = get_config_val("ALPACA_API_KEY")
+    secret_key = get_config_val("ALPACA_SECRET_KEY")
+    paper_str = str(get_config_val("ALPACA_PAPER", "True")).lower()
+    is_paper = paper_str in ("true", "1")
+
+    if not api_key or not secret_key or "XXX" in api_key:
+        return None
+    try:
+        return TradingClient(api_key, secret_key, paper=is_paper)
+    except Exception as e:
+        st.error(f"Error conectando a Alpaca: {e}")
+        return None
+
 
 # ==============================================================================
-# FUNCIONES DE CONSULTA Y PERSISTENCIA
+# CONSULTAS A SUPABASE, QDRANT Y ALPACA
 # ==============================================================================
-def fetch_universe():
+def fetch_universe() -> pd.DataFrame:
     supabase = get_supabase_client()
     try:
         res = supabase.table("asset_universe").select("*").order("tipo_instrumento").order("codigo").execute()
@@ -82,26 +106,24 @@ def fetch_universe():
         return pd.DataFrame()
 
 
-def fetch_scout_dates():
+def fetch_scout_dates() -> List[str]:
     supabase = get_supabase_client()
     try:
         res = supabase.table("market_scout_rankings").select("fecha_proceso").order("fecha_proceso", desc=True).execute()
         if not res.data:
             return []
-        dates = sorted(list({r["fecha_proceso"] for r in res.data}), reverse=True)
-        return dates
+        return sorted(list({r["fecha_proceso"] for r in res.data}), reverse=True)
     except Exception:
         return []
 
 
-def fetch_scout_rankings(fecha: str):
+def fetch_scout_rankings(fecha: str) -> pd.DataFrame:
     supabase = get_supabase_client()
     try:
         res = supabase.table("market_scout_rankings").select("*").eq("fecha_proceso", fecha).execute()
         if not res.data:
             return pd.DataFrame()
         df = pd.DataFrame(res.data)
-        # Conversión de columnas numéricas
         num_cols = ["precio_actual", "rendimiento_1w", "rendimiento_1m", "rendimiento_6m", "rendimiento_1y", "dividend_yield", "volumen_promedio"]
         for c in num_cols:
             if c in df.columns:
@@ -112,7 +134,7 @@ def fetch_scout_rankings(fecha: str):
         return pd.DataFrame()
 
 
-def fetch_trades():
+def fetch_trades() -> pd.DataFrame:
     supabase = get_supabase_client()
     try:
         res = supabase.table("trade_journal").select("*").order("created_at", desc=True).execute()
@@ -127,7 +149,7 @@ def fetch_trades():
         return pd.DataFrame()
 
 
-def fetch_memories():
+def fetch_memories() -> List[dict]:
     qc = get_qdrant_client()
     try:
         collections = [c.name for c in qc.get_collections().collections]
@@ -139,27 +161,136 @@ def fetch_memories():
         return []
 
 
+def fetch_alpaca_portfolio_data() -> Tuple[dict, pd.DataFrame]:
+    """Obtiene métricas de cuenta y posiciones activas desde Alpaca con su clasificación."""
+    client = get_alpaca_client()
+    if not client:
+        return {}, pd.DataFrame()
+
+    try:
+        account = client.get_account()
+        positions_raw = client.get_all_positions()
+
+        account_info = {
+            "equity": float(account.equity),
+            "cash": float(account.cash),
+            "buying_power": float(account.buying_power),
+            "portfolio_value": float(account.portfolio_value),
+            "initial_margin": float(account.initial_margin)
+        }
+
+        if not positions_raw:
+            return account_info, pd.DataFrame()
+
+        rows = []
+        df_univ = fetch_universe()
+        univ_map = {}
+        if not df_univ.empty and "codigo" in df_univ.columns:
+            univ_map = dict(zip(df_univ["codigo"], df_univ["tipo_instrumento"]))
+
+        for p in positions_raw:
+            raw_sym = p.symbol.upper()
+            # Mapear formato cripto Alpaca (BTC/USD -> BTC-USD) para consulta
+            clean_sym = raw_sym.replace("/", "-")
+            
+            # Clasificar tipo de instrumento
+            inst_type = univ_map.get(clean_sym) or univ_map.get(raw_sym)
+            if not inst_type:
+                if "-USD" in clean_sym or "/USD" in raw_sym:
+                    inst_type = "CRIPTOS"
+                elif raw_sym in ["SPY", "QQQ", "IWM", "VOO", "VTI", "SMH", "XLK", "XLF"]:
+                    inst_type = "FONDOS"
+                else:
+                    inst_type = "ACCIONES"
+
+            mv = float(p.market_value)
+            rows.append({
+                "symbol": clean_sym,
+                "symbol_alpaca": raw_sym,
+                "qty": float(p.qty),
+                "market_value": mv,
+                "current_price": float(p.current_price),
+                "avg_entry_price": float(p.avg_entry_price),
+                "unrealized_pl": float(p.unrealized_pl),
+                "unrealized_plpc": float(p.unrealized_plpc) * 100,
+                "tipo_instrumento": inst_type
+            })
+
+        df_positions = pd.DataFrame(rows)
+        return account_info, df_positions
+    except Exception as e:
+        st.error(f"Error consultando portafolio de Alpaca: {e}")
+        return {}, pd.DataFrame()
+
+
+# ==============================================================================
+# MOTOR DE HISTORIAL PONDERADO Y BENCHMARKS
+# ==============================================================================
+@st.cache_data(ttl=300)
+def fetch_historical_series(symbols: List[str], period: str) -> pd.DataFrame:
+    """Descarga cotizaciones históricas para activos y benchmarks desde Yahoo Finance."""
+    interval_map = {
+        "5d": "15m",
+        "1mo": "1d",
+        "6mo": "1d",
+        "1y": "1d",
+        "5y": "1wk"
+    }
+    interval = interval_map.get(period, "1d")
+    
+    # Benchmarks de mercado solicitados
+    benchmarks = ["^NYA", "^GSPC", "^DJI", "^MXX"]
+    all_tickers = list(dict.fromkeys(symbols + benchmarks))
+
+    try:
+        df = yf.download(
+            tickers=all_tickers,
+            period=period,
+            interval=interval,
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    closes = pd.DataFrame()
+    for t in all_tickers:
+        try:
+            if len(all_tickers) == 1:
+                closes[t] = df["Close"]
+            else:
+                if t in df and "Close" in df[t]:
+                    closes[t] = df[t]["Close"]
+        except Exception:
+            continue
+
+    closes = closes.ffill().bfill()
+    return closes
+
+
 # ==============================================================================
 # BARRA LATERAL (SIDEBAR)
 # ==============================================================================
 st.sidebar.title("🎛️ Centro de Mando")
-if st.sidebar.button("🔄 Refrescar Tablero", width='stretch'):
+if st.sidebar.button("🔄 Refrescar Tablero", use_container_width=True):
+    st.cache_data.clear()
     st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Estado del Sistema:**")
-st.sidebar.write(f"• **Supabase DB:** {'🟢 Conectado' if os.getenv('SUPABASE_URL') else '🔴 Desconectado'}")
-st.sidebar.write(f"• **Qdrant Vector DB:** {'🟢 Conectado' if os.getenv('QDRANT_URL') else '🔴 Desconectado'}")
-st.sidebar.write(f"• **Broker API:** Alpaca Paper Cloud")
-st.sidebar.write(f"• **Motor LLM:** Claude 5.5 Sonnet")
+st.sidebar.write(f"• **Supabase DB:** {'🟢 Conectado' if get_config_val('SUPABASE_URL') else '🔴 Desconectado'}")
+st.sidebar.write(f"• **Qdrant Vector DB:** {'🟢 Conectado' if get_config_val('QDRANT_URL') else '🔴 Desconectado'}")
+st.sidebar.write(f"• **Broker API:** {'🟢 Alpaca Conectado' if get_config_val('ALPACA_API_KEY') else '🔴 Alpaca Desconectado'}")
+st.sidebar.write(f"• **Motor LLM:** Claude 3.5 Sonnet")
 st.sidebar.markdown("---")
-st.sidebar.info("💡 **Tip:** Puedes modificar los activos activos en la pestaña 'Administrar Universo' para afinar el escaneo de mañana.")
+st.sidebar.info("💡 **Tip:** Revisa la pestaña 'Métricas y Cartera' para auditar la exposición viva de Alpaca y contrastarla contra el NYSE, S&P 500, Dow Jones y el IPC Mexicano.")
 
 # ==============================================================================
 # PANEL PRINCIPAL Y PESTAÑAS
 # ==============================================================================
 st.title("📊 Terminal Cuantitativa y Célula Multi-Agente")
-st.caption("Supervisión del universo analizable, rankings de Yahoo Finance, bitácora de ejecución y memoria heurística.")
+st.caption("Supervisión de cartera en vivo en Alpaca, simulación teórica contra índices, rankings de Yahoo Finance y memoria heurística.")
 
 tab_scout, tab_universe, tab_trades, tab_analytics, tab_memory = st.tabs([
     "🏆 Explorador de Rankings (Top 30)",
@@ -175,28 +306,26 @@ tab_scout, tab_universe, tab_trades, tab_analytics, tab_memory = st.tabs([
 # ==============================================================================
 with tab_scout:
     st.subheader("🎯 Oportunidades Filtradas por Yahoo Finance (Top 30)")
-    
     available_dates = fetch_scout_dates()
-    
+
     if not available_dates:
         st.warning("No se encontraron escaneos en 'market_scout_rankings'. Ejecuta primero `python market_scout.py`.")
     else:
-        # Filtros de encabezado
         f_col1, f_col2, f_col3, f_col4 = st.columns([2, 2, 2, 3])
         with f_col1:
             selected_date = st.selectbox("📅 Fecha de Proceso:", available_dates, index=0)
-        
+
         df_scout = fetch_scout_rankings(selected_date)
 
         if not df_scout.empty:
             with f_col2:
                 tipo_options = ["TODOS"] + sorted(list(df_scout["tipo_instrumento"].unique()))
                 selected_tipo = st.selectbox("🏷️ Tipo de Instrumento:", tipo_options)
-            
+
             with f_col3:
                 rec_options = ["TODAS"] + sorted(list(df_scout["recomendacion"].dropna().unique()))
                 selected_rec = st.selectbox("⭐ Recomendación:", rec_options)
-            
+
             with f_col4:
                 sort_metric = st.selectbox(
                     "📊 Ordenar por Mayor Rendimiento / Métrica:",
@@ -212,35 +341,31 @@ with tab_scout:
                     format_func=lambda x: x[0]
                 )
 
-            # Aplicar filtros
             filtered_scout = df_scout.copy()
             if selected_tipo != "TODOS":
                 filtered_scout = filtered_scout[filtered_scout["tipo_instrumento"] == selected_tipo]
             if selected_rec != "TODAS":
                 filtered_scout = filtered_scout[filtered_scout["recomendacion"] == selected_rec]
 
-            # Ordenar de mayor a menor
             col_to_sort = sort_metric[1]
             filtered_scout = filtered_scout.sort_values(by=col_to_sort, ascending=False).reset_index(drop=True)
 
-            # Tarjetas de resumen métrico rápido
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Activos Listados", len(filtered_scout))
             max_asset = filtered_scout.iloc[0]["codigo"] if not filtered_scout.empty else "N/A"
             max_val = filtered_scout.iloc[0][col_to_sort] if not filtered_scout.empty else 0.0
-            
+
             suffix = "%" if "rendimiento" in col_to_sort or "dividend" in col_to_sort else (" USD" if "precio" in col_to_sort else "")
             k2.metric(f"Líder en {sort_metric[0][:15]}...", f"{max_asset}", f"{max_val:+.2f}{suffix}")
-            
+
             avg_1y = filtered_scout["rendimiento_1y"].mean() if not filtered_scout.empty else 0.0
             k3.metric("Rendimiento 1Y Promedio", f"{avg_1y:+.2f}%")
-            
+
             buy_count = (filtered_scout["recomendacion"].str.contains("BUY", na=False)).sum()
             k4.metric("Con Voto 'BUY' / 'STRONG BUY'", f"{buy_count} activos")
 
             st.markdown("---")
 
-            # Gráfico de barras Plotly de los Top 10 según orden
             if not filtered_scout.empty:
                 top_10_chart = filtered_scout.head(10).copy()
                 fig_scout = px.bar(
@@ -255,12 +380,9 @@ with tab_scout:
                 )
                 fig_scout.update_traces(texttemplate='%{text:.2f}', textposition='outside')
                 fig_scout.update_layout(template="plotly_dark", height=380, margin=dict(l=20, r=20, t=40, b=20))
-                st.plotly_chart(fig_scout, width='stretch')
+                st.plotly_chart(fig_scout, use_container_width=True)
 
-            # Tabla interactiva con formato adaptativo por columnas
             st.markdown("#### 📋 Matriz Detallada de Rendimientos y Ratios")
-
-            # Configuración de columnas de Streamlit
             column_configuration = {
                 "codigo": st.column_config.TextColumn("Código / Ticker", width="small"),
                 "nombre": st.column_config.TextColumn("Nombre del Activo", width="medium"),
@@ -285,24 +407,9 @@ with tab_scout:
             st.dataframe(
                 filtered_scout[display_cols],
                 column_config=column_configuration,
-                width='stretch',
+                use_container_width=True,
                 hide_index=True
             )
-
-            # Visualizador de descripciones de empresa / fondo / contrato
-            st.markdown("#### 🔍 Inspeccionar Perfil Corporativo o de Contrato")
-            selected_inspect = st.selectbox(
-                "Selecciona un activo para ver su descripción de negocio completa:",
-                options=filtered_scout["codigo"].tolist()
-            )
-            if selected_inspect:
-                row_sel = filtered_scout[filtered_scout["codigo"] == selected_inspect].iloc[0]
-                c_desc1, c_desc2 = st.columns([3, 1])
-                with c_desc1:
-                    st.info(f"**Descripción del Activo ({row_sel['nombre']}):**\n\n{row_sel.get('descripcion', 'Sin descripción.')}")
-                with c_desc2:
-                    st.write("**Metadatos Adicionales:**")
-                    st.json(row_sel.get("metrica_extra", {}))
         else:
             st.info("Sin registros para la fecha seleccionada.")
 
@@ -312,24 +419,18 @@ with tab_scout:
 # ==============================================================================
 with tab_universe:
     st.subheader("⚙️ Control del Universo de Activos (`asset_universe`)")
-    st.write(
-        "Administra qué instrumentos serán analizados por `market_scout.py`. "
-        "Los activos marcados como **Pausados** se omitirán del escaneo diario para ahorrar tiempo y ancho de banda."
-    )
-
     supabase = get_supabase_client()
     df_univ = fetch_universe()
 
-    # Formulario para Agregar Activo
     with st.expander("➕ Agregar Nuevo Activo al Universo", expanded=False):
         with st.form("form_add_asset", clear_on_submit=True):
             f_col1, f_col2, f_col3 = st.columns([2, 3, 2])
             with f_col1:
-                in_code = st.text_input("Código / Ticker bursátil *", placeholder="ej. PLTR, ETH-USD, EURUSD=X").strip().upper()
+                in_code = st.text_input("Código / Ticker bursátil *", placeholder="ej. PLTR, BTC-USD, SPY").strip().upper()
             with f_col2:
                 in_name = st.text_input("Nombre de la Empresa o Instrumento", placeholder="ej. Palantir Technologies Inc.")
             with f_col3:
-                in_type = st.selectbox("Tipo de Instrumento *", ["ACCIONES", "DIVIDENDOS", "FONDOS", "CRIPTOS", "FOREX", "OPCIONES"])
+                in_type = st.selectbox("Tipo de Instrumento *", ["ACCIONES", "DIVIDENDOS", "FONDOS", "BONOS", "CRIPTOS", "FOREX", "OPCIONES"])
 
             submit_add = st.form_submit_button("Guardar en el Universo")
             if submit_add:
@@ -346,16 +447,13 @@ with tab_universe:
                             "actualizado_el": pd.Timestamp.utcnow().isoformat()
                         }
                         supabase.table("asset_universe").upsert(record_add, on_conflict="codigo").execute()
-                        st.success(f"Activo {in_code} añadido exitosamente como activo habilitado.")
+                        st.success(f"Activo {in_code} añadido exitosamente.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error al agregar activo: {e}")
 
-    # Controles para Pausar / Reactivar y Remover
-    st.markdown("#### 🔄 Modificar Estado o Eliminar Activo Existente")
     if not df_univ.empty:
         col_act1, col_act2, col_act3, col_act4 = st.columns([3, 2, 2, 2])
-        
         with col_act1:
             selected_ticker = st.selectbox(
                 "Selecciona el activo a gestionar:",
@@ -369,20 +467,18 @@ with tab_universe:
         with col_act2:
             st.write(f"Estado actual: **{'🟢 Activo' if current_status else '⏸️ Pausado'}**")
             toggle_label = "Pausar Activo" if current_status else "Reactivar Activo"
-            if st.button(toggle_label, width='stretch'):
+            if st.button(toggle_label, use_container_width=True):
                 try:
                     supabase.table("asset_universe").update({"activo": not current_status}).eq("codigo", selected_ticker).execute()
-                    st.toast(f"{selected_ticker} ahora está {'Activo' if not current_status else 'Pausado'}.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error actualizando estado: {e}")
 
         with col_act3:
             st.write("Acción definitiva:")
-            if st.button("🗑️ Eliminar del Universo", type="secondary", width='stretch'):
+            if st.button("🗑️ Eliminar del Universo", type="secondary", use_container_width=True):
                 try:
                     supabase.table("asset_universe").delete().eq("codigo", selected_ticker).execute()
-                    st.toast(f"Activo {selected_ticker} eliminado permanentemente.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error al eliminar: {e}")
@@ -391,14 +487,6 @@ with tab_universe:
             st.write("Filtro por tipo de lista:")
             filter_univ_type = st.selectbox("Ver:", ["TODOS"] + sorted(list(df_univ["tipo_instrumento"].unique())))
 
-        # Resumen cuantitativo del universo
-        u_m1, u_m2, u_m3, u_m4 = st.columns(4)
-        u_m1.metric("Total en Catálogo", len(df_univ))
-        u_m2.metric("Habilitados (Activos)", len(df_univ[df_univ["activo"] == True]))
-        u_m3.metric("Pausados", len(df_univ[df_univ["activo"] == False]))
-        u_m4.metric("Clases de Activo", df_univ["tipo_instrumento"].nunique())
-
-        # Tabla de visualización del universo
         view_univ = df_univ.copy()
         if filter_univ_type != "TODOS":
             view_univ = view_univ[view_univ["tipo_instrumento"] == filter_univ_type]
@@ -413,11 +501,9 @@ with tab_universe:
                 "origen": st.column_config.TextColumn("Origen", width="small"),
                 "actualizado_el": st.column_config.DatetimeColumn("Última Sincro", format="YYYY-MM-DD HH:mm")
             },
-            width='stretch',
+            use_container_width=True,
             hide_index=True
         )
-    else:
-        st.info("No hay activos registrados en 'asset_universe'. Ejecuta `python sync_universe.py` o agrega uno arriba.")
 
 
 # ==============================================================================
@@ -428,7 +514,7 @@ with tab_trades:
     df_trades = fetch_trades()
 
     if df_trades.empty:
-        st.info("Sin operaciones registradas aún. Corre `python main.py` para generar trades.")
+        st.info("Sin operaciones registradas aún en Supabase (`trade_journal`).")
     else:
         t_col1, t_col2 = st.columns(2)
         with t_col1:
@@ -446,59 +532,254 @@ with tab_trades:
             column_config={
                 "price": st.column_config.NumberColumn("Precio", format="$%.2f"),
                 "total_value": st.column_config.NumberColumn("Volumen Total", format="$%.2f"),
-                "quantity": st.column_config.NumberColumn("Acciones", format="%.0f")
+                "quantity": st.column_config.NumberColumn("Cantidad", format="%.2f")
             },
-            width='stretch',
+            use_container_width=True,
             hide_index=True
         )
 
-        st.markdown("#### 🧠 Inspección de Rationale Operativo y Auditoría")
-        selected_trade_id = st.selectbox("Selecciona ID de Trade:", filtered_trades["id"].tolist())
-        if selected_trade_id:
-            row_tr = filtered_trades[filtered_trades["id"] == selected_trade_id].iloc[0]
-            c_r1, c_r2 = st.columns(2)
-            with c_r1:
-                st.markdown("**Tesis / Rationale del CIO:**")
-                st.info(row_tr.get("rationale", "Sin registro"))
-            with c_r2:
-                st.markdown("**Evaluación Post-Trade del Auditor:**")
-                st.success(row_tr.get("post_analysis", "Sin registro"))
-
 
 # ==============================================================================
-# PESTAÑA 4: TELEMETRÍA Y MÉTRICAS DE CARTERA
+# PESTAÑA 4: TELEMETRÍA, CARTERA EN ALPACA Y SIMULACIÓN HISTÓRICA
 # ==============================================================================
 with tab_analytics:
-    st.subheader("📈 Distribución de Capital y Exposición")
-    df_trades = fetch_trades()
+    st.subheader("📈 Cartera Activa en Alpaca y Simulación Histórica Teórica")
 
-    if not df_trades.empty:
-        col_g1, col_g2 = st.columns(2)
-        with col_g1:
-            fig_pie = px.pie(
-                df_trades,
-                names="symbol",
-                values="total_value",
-                title="Distribución de Capital por Activo",
-                hole=0.4,
-                color_discrete_sequence=px.colors.qualitative.Plotly
-            )
-            fig_pie.update_layout(template="plotly_dark", height=400)
-            st.plotly_chart(fig_pie, width='stretch')
+    acct_info, df_pos = fetch_alpaca_portfolio_data()
 
-        with col_g2:
-            fig_bar = px.bar(
-                df_trades,
-                x="created_at",
-                y="total_value",
-                color="action",
-                title="Historial de Operaciones por Timestamp",
-                labels={"total_value": "Monto Total (USD)", "created_at": "Fecha/Hora"}
-            )
-            fig_bar.update_layout(template="plotly_dark", height=400)
-            st.plotly_chart(fig_bar, width='stretch')
+    if not acct_info:
+        st.warning("⚠️ No se pudo obtener la información de Alpaca. Verifica tus credenciales `ALPACA_API_KEY` y `ALPACA_SECRET_KEY`.")
     else:
-        st.info("Sin datos suficientes en la bitácora para generar gráficos de cartera.")
+        # 1. KPIs del Portafolio en Vivo
+        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+        kpi1.metric("Valor Total (Equity)", f"${acct_info['equity']:,.2f}")
+        
+        cash_val = acct_info['cash']
+        kpi2.metric(
+            "Efectivo Líquido",
+            f"${cash_val:,.2f}",
+            delta="Margen en uso" if cash_val < 0 else "Liquidez positiva",
+            delta_color="inverse" if cash_val < 0 else "normal"
+        )
+        
+        kpi3.metric("Poder de Compra (BP)", f"${acct_info['buying_power']:,.2f}")
+        
+        total_mv = df_pos["market_value"].sum() if not df_pos.empty else 0.0
+        kpi4.metric("Capital Invertido", f"${total_mv:,.2f}")
+
+        total_upl = df_pos["unrealized_pl"].sum() if not df_pos.empty else 0.0
+        kpi5.metric("PnL No Realizado", f"${total_upl:+,.2f}", delta=f"{total_upl:+,.2f}")
+
+        st.markdown("---")
+
+        if df_pos.empty:
+            st.info("La cuenta de Alpaca no tiene posiciones abiertas en este momento.")
+        else:
+            # 2. FILTRO POR TIPO DE INSTRUMENTO
+            f_col1, f_col2 = st.columns([2, 4])
+            with f_col1:
+                available_types = ["TODOS"] + sorted(list(df_pos["tipo_instrumento"].unique()))
+                selected_inst_filter = st.selectbox("🎯 Filtrar Cartera por Tipo de Instrumento:", available_types)
+
+            df_pos_filtered = df_pos.copy()
+            if selected_inst_filter != "TODOS":
+                df_pos_filtered = df_pos_filtered[df_pos_filtered["tipo_instrumento"] == selected_inst_filter]
+
+            # 3. GRÁFICAS DE PAY (PIE CHARTS) DE COMPOSICIÓN
+            st.markdown("#### 🥧 Distribución del Portafolio Activo")
+            c_pie1, c_pie2 = st.columns(2)
+
+            with c_pie1:
+                # Composición por Activo Individual
+                fig_pie_assets = px.pie(
+                    df_pos_filtered,
+                    names="symbol",
+                    values="market_value",
+                    title=f"Composición por Activo Individual ({selected_inst_filter})",
+                    hole=0.4,
+                    color_discrete_sequence=px.colors.qualitative.Prism
+                )
+                fig_pie_assets.update_traces(textinfo="percent+label", pull=[0.02] * len(df_pos_filtered))
+                fig_pie_assets.update_layout(template="plotly_dark", height=420, margin=dict(l=20, r=20, t=50, b=20))
+                st.plotly_chart(fig_pie_assets, use_container_width=True)
+
+            with c_pie2:
+                # Composición por Clase de Activo (con o sin Efectivo)
+                pie_class_data = df_pos.groupby("tipo_instrumento")["market_value"].sum().reset_index()
+                if cash_val > 0:
+                    pie_class_data = pd.concat([
+                        pie_class_data,
+                        pd.DataFrame([{"tipo_instrumento": "EFECTIVO (CASH)", "market_value": cash_val}])
+                    ], ignore_index=True)
+
+                fig_pie_class = px.pie(
+                    pie_class_data,
+                    names="tipo_instrumento",
+                    values="market_value",
+                    title="Distribución Global por Clase de Activo y Liquidez",
+                    hole=0.4,
+                    color_discrete_sequence=px.colors.qualitative.Safe
+                )
+                fig_pie_class.update_traces(textinfo="percent+label")
+                fig_pie_class.update_layout(template="plotly_dark", height=420, margin=dict(l=20, r=20, t=50, b=20))
+                st.plotly_chart(fig_pie_class, use_container_width=True)
+
+            # 4. TABLA DETALLADA DE POSICIONES
+            with st.expander("🔎 Ver Tabla Detallada de Posiciones en Alpaca", expanded=False):
+                st.dataframe(
+                    df_pos_filtered[[
+                        "symbol", "tipo_instrumento", "qty", "current_price",
+                        "market_value", "avg_entry_price", "unrealized_pl", "unrealized_plpc"
+                    ]],
+                    column_config={
+                        "symbol": st.column_config.TextColumn("Ticker"),
+                        "tipo_instrumento": st.column_config.TextColumn("Tipo"),
+                        "qty": st.column_config.NumberColumn("Cantidad", format="%.4f"),
+                        "current_price": st.column_config.NumberColumn("Precio Spot", format="$%.2f"),
+                        "market_value": st.column_config.NumberColumn("Valor de Mercado", format="$%.2f"),
+                        "avg_entry_price": st.column_config.NumberColumn("Precio Promedio", format="$%.2f"),
+                        "unrealized_pl": st.column_config.NumberColumn("PnL ($)", format="$%+.2f"),
+                        "unrealized_plpc": st.column_config.NumberColumn("PnL (%)", format="%+.2f%%")
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            st.markdown("---")
+
+            # 5. SIMULACIÓN HISTÓRICA TEÓRICA vs BENCHMARKS INTERNACIONALES
+            st.markdown("#### 📊 Comportamiento Histórico Teórico vs Índices de Referencia")
+            st.caption(
+                "Simula el retorno porcentual que habría obtenido la combinación actual de tu portafolio en comparación directa con el "
+                "**NYSE Composite (^NYA)**, **S&P 500 (^GSPC)**, **Dow Jones (^DJI)** y el **IPC Mexicano (^MXX)**."
+            )
+
+            # Controles de temporalidad
+            t_col, _ = st.columns([3, 3])
+            with t_col:
+                timeframe_label = st.radio(
+                    "Selecciona el horizonte temporal:",
+                    options=["1W (1 Semana)", "1M (1 Mes)", "6M (6 Meses)", "1Y (1 Año)", "5Y (5 Años)"],
+                    index=3,
+                    horizontal=True
+                )
+
+            period_key_map = {
+                "1W (1 Semana)": "5d",
+                "1M (1 Mes)": "1mo",
+                "6M (6 Meses)": "6mo",
+                "1Y (1 Año)": "1y",
+                "5Y (5 Años)": "5y"
+            }
+            selected_period = period_key_map[timeframe_label]
+
+            # Activos a simular (según el filtro seleccionado)
+            symbols_to_simulate = df_pos_filtered["symbol"].tolist()
+
+            if not symbols_to_simulate:
+                st.warning(f"No hay activos en la cartera para la categoría: {selected_inst_filter}.")
+            else:
+                with st.spinner("Descargando series históricas y computando curvas normalizadas..."):
+                    hist_data = fetch_historical_series(symbols_to_simulate, selected_period)
+
+                if hist_data.empty:
+                    st.error("No se pudieron recuperar las cotizaciones históricas desde Yahoo Finance.")
+                else:
+                    # Normalizar curvas a rendimiento acumulado base 0%
+                    pct_df = pd.DataFrame(index=hist_data.index)
+
+                    # Ponderación del portafolio actual
+                    total_alloc_value = df_pos_filtered["market_value"].sum()
+                    weights = {
+                        row["symbol"]: (row["market_value"] / total_alloc_value)
+                        for _, row in df_pos_filtered.iterrows()
+                    }
+
+                    # Curva ponderada del portafolio
+                    port_returns = pd.Series(0.0, index=hist_data.index)
+                    valid_weights_sum = 0.0
+
+                    for sym in symbols_to_simulate:
+                        if sym in hist_data and not hist_data[sym].dropna().empty:
+                            s = hist_data[sym].dropna()
+                            base_price = s.iloc[0]
+                            if base_price > 0:
+                                sym_return = ((s / base_price) - 1.0) * 100.0
+                                w = weights.get(sym, 0.0)
+                                port_returns = port_returns.add(sym_return * w, fill_value=0.0)
+                                valid_weights_sum += w
+
+                    # Reescalar si algún símbolo no tuvo datos completos
+                    if valid_weights_sum > 0:
+                        port_returns = port_returns / valid_weights_sum
+
+                    pct_df["Portafolio Teórico"] = port_returns
+
+                    # Curvas de Benchmarks
+                    benchmark_labels = {
+                        "^NYA": "NYSE Composite (^NYA)",
+                        "^GSPC": "S&P 500 (^GSPC)",
+                        "^DJI": "Dow Jones 30 (^DJI)",
+                        "^MXX": "S&P/BMV IPC México (^MXX)"
+                    }
+
+                    for b_ticker, b_name in benchmark_labels.items():
+                        if b_ticker in hist_data and not hist_data[b_ticker].dropna().empty:
+                            b_series = hist_data[b_ticker].dropna()
+                            b_base = b_series.iloc[0]
+                            if b_base > 0:
+                                pct_df[b_name] = ((b_series / b_base) - 1.0) * 100.0
+
+                    # Graficar con Plotly
+                    fig_comp = go.Figure()
+
+                    # Línea del Portafolio (resaltada en color verde)
+                    fig_comp.add_trace(go.Scatter(
+                        x=pct_df.index,
+                        y=pct_df["Portafolio Teórico"],
+                        mode="lines",
+                        name=f"🚀 Portafolio Teórico ({selected_inst_filter})",
+                        line=dict(color="#00FFAA", width=3.5)
+                    ))
+
+                    # Líneas de Benchmarks
+                    colors_bench = {
+                        "NYSE Composite (^NYA)": "#3498DB",
+                        "S&P 500 (^GSPC)": "#F39C12",
+                        "Dow Jones 30 (^DJI)": "#9B59B6",
+                        "S&P/BMV IPC México (^MXX)": "#E74C3C"
+                    }
+
+                    for b_name, b_col in colors_bench.items():
+                        if b_name in pct_df.columns:
+                            fig_comp.add_trace(go.Scatter(
+                                x=pct_df.index,
+                                y=pct_df[b_name],
+                                mode="lines",
+                                name=b_name,
+                                line=dict(color=b_col, width=1.8, dash="dot" if "IPC" in b_name else "solid")
+                            ))
+
+                    fig_comp.update_layout(
+                        template="plotly_dark",
+                        height=520,
+                        title=f"Rendimiento Porcentual Acumulado — Período: {timeframe_label} (Filtro: {selected_inst_filter})",
+                        xaxis_title="Fecha",
+                        yaxis_title="Retorno Acumulado (%)",
+                        yaxis=dict(ticksuffix="%"),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        margin=dict(l=20, r=20, t=70, b=20),
+                        hovermode="x unified"
+                    )
+
+                    st.plotly_chart(fig_comp, use_container_width=True)
+
+                    # Tabla comparativa de retornos acumulados finales
+                    st.markdown("##### 📌 Comparativa de Retornos en el Período Seleccionado")
+                    m_cols = st.columns(len(pct_df.columns))
+                    for idx, col_name in enumerate(pct_df.columns):
+                        val_end = pct_df[col_name].iloc[-1] if not pct_df.empty else 0.0
+                        m_cols[idx].metric(col_name.replace(" (^NYA)", "").replace(" (^GSPC)", "").replace(" (^DJI)", "").replace(" (^MXX)", ""), f"{val_end:+.2f}%")
 
 
 # ==============================================================================
@@ -506,9 +787,8 @@ with tab_analytics:
 # ==============================================================================
 with tab_memory:
     st.subheader("🧠 Colección Vectorial `market_lessons` (Qdrant)")
-    st.write("Lecciones cuantitativas, heurísticas y advertencias de riesgo indexadas por los agentes.")
-
     memories = fetch_memories()
+
     if not memories:
         st.info("No se registran vectores en la colección 'market_lessons' de Qdrant.")
     else:
